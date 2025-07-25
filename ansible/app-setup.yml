@@ -1,0 +1,115 @@
+- name: Application Server Configuration
+  hosts: appserver
+  become: yes
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Add ondrej/php PPA
+      apt_repository:
+        repo: ppa:ondrej/php
+        state: present
+        update_cache: yes
+
+    - name: Install PHP, MySQL client, and Nginx
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - php
+        - php8.3-fpm
+        - php8.3-mysql
+        - mysql-client
+        - nginx
+
+    - name: Ensure apache is stopped
+      service:
+        name: apache2
+        state: stopped
+
+    - name: Enable PHP-FPM handling in Nginx config
+      blockinfile:
+        path: /etc/nginx/sites-available/default
+        marker: "# {mark} ANSIBLE MANAGED BLOCK: PHP-FPM"
+        insertafter: "^\\s*index.+$"
+        block: |
+          location ~ \.php$ {
+              include snippets/fastcgi-php.conf;
+              fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+          }
+
+    - name: Ensure php-fpm is started and enabled
+      service:
+        name: php8.3-fpm
+        state: started
+        enabled: yes
+
+    - name: Ensure nginx is started and enabled
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Copy submit.php to web root
+      copy:
+        src: ./submit.php
+        dest: /var/www/html/
+        owner: www-data
+        group: www-data
+        mode: '0644'
+
+    - name: Upload SQL init script
+      copy:
+        src: ./sql/init_db.sql
+        dest: /tmp/init_db.sql
+        mode: '0644'
+
+    - name: Copy environment file from Terraform
+      copy:
+        src: ./db_env.sh
+        dest: /etc/profile.d/db_env.sh
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Execute init_db.sql to create database and table
+      shell: |
+        . /etc/profile.d/db_env.sh && mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" < /tmp/init_db.sql
+      args:
+        executable: /bin/bash
+
+    - name: Read db_env.sh content from file
+      slurp:
+        src: ./db_env.sh
+      register: db_env_raw
+      delegate_to: localhost
+
+    - name: Convert exported variables to env[...] format
+      set_fact:
+       php_fpm_env_block: |
+        {% for line in (db_env_raw.content | b64decode).splitlines() %}
+        {% if line.startswith('export ') %}
+        env[{{ line.split('=')[0].split()[1] }}]={{ line.split('=')[1] }}
+        {% endif %}
+        {% endfor %}
+
+    - name: Inject DB env variables into PHP-FPM config
+      blockinfile:
+        path: /etc/php/8.3/fpm/pool.d/www.conf
+        marker: "; {mark} ANSIBLE DB ENV"
+        block: "{{ php_fpm_env_block }}"
+      become: yes
+
+    - name: Reloaded PHP-FPM to apply env variables
+      service:
+       name: php8.3-fpm
+       state: reloaded
+      become: yes
+
+    - name: Restart PHP-FPM to apply changes
+      service:
+        name: php8.3-fpm
+        state: restarted
+      become: yes

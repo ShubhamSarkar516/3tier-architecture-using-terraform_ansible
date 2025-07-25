@@ -1,0 +1,51 @@
+- name: Web Server Configuration
+  hosts: webserver
+  become: yes
+
+  vars:
+    app_server_ip: "{{ hostvars[groups['appserver'][0]].ansible_host | default(groups['appserver'][0]) }}"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Start and enable Nginx
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Copy HTML registration form
+      copy:
+        src: ./forms.html
+        dest: /var/www/html/
+
+    - name: Add PHP reverse proxy block to Nginx config inside server block
+      blockinfile:
+        path: /etc/nginx/sites-available/default
+        insertafter: 'server_name _;'
+        marker: "# {mark} ANSIBLE PHP PROXY BLOCK"
+        block: |
+          location ~ \.php$ {
+              proxy_pass http://{{ app_server_ip }};
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+          }
+
+    - name: Test Nginx configuration before reload
+      command: nginx -t
+      register: nginx_test
+      changed_when: false
+      failed_when: nginx_test.rc != 0
+
+    - name: Reload Nginx to apply changes
+      service:
+        name: nginx
+        state: reloaded
+      when: nginx_test.rc == 0
